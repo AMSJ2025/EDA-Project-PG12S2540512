@@ -178,9 +178,19 @@ def build_submission_json(
             "feature_rows": int(len(feature_df)),
             "timestamp_min": str(ts_df[timestamp_col].min()) if len(ts_df) else "",
             "timestamp_max": str(ts_df[timestamp_col].max()) if len(ts_df) else "",
+            "automatic_quality_summary": globals().get("data_quality_auto_summary", ""),
+            "invalid_rows_removed": int(globals().get("invalid_rows_removed", 0)),
+            "duplicate_timestamp_count": int(globals().get("duplicate_timestamp_count", 0)),
+            "larger_than_expected_time_gap_count": int(globals().get("time_gap_count", 0)),
+            "inferred_frequency": globals().get("inferred_frequency_text", ""),
+            "target_summary": globals().get("target_summary_text", ""),
             "missing_discussion": missing_discussion,
             "outlier_discussion": outlier_discussion,
+            "automatic_outlier_summary": globals().get("outlier_auto_summary", ""),
+            "outlier_count_iqr": int(globals().get("outlier_count", 0)),
+            "outlier_percent_iqr": round(float(globals().get("outlier_percent", 0.0)), 3),
             "resampling_discussion": resampling_discussion,
+            "automatic_resampling_summary": globals().get("resampling_auto_summary", ""),
         },
         "feature_engineering": {
             "baseline_features_present": ["lag_1", "lag_24", "rolling_mean_24", "hour", "weekend", "month"],
@@ -200,28 +210,54 @@ def build_submission_json(
             ],
         },
         "modeling_evaluation": {
-            "has_metrics_table": isinstance(results_df, pd.DataFrame),
+            "has_metrics_table": isinstance(results_df, pd.DataFrame) and not results_df.empty,
             "results_table": results_table,
             "time_based_split_evidence": (
-                "Used chronological 80/20 time-based split: earlier records for training "
-                "and later records for testing."
-                if isinstance(results_df, pd.DataFrame)
+                globals().get(
+                    "time_split_evidence",
+                    "Used chronological 80/20 time-based split: earlier records for training and later records for testing."
+                )
+                if isinstance(results_df, pd.DataFrame) and not results_df.empty
                 else ""
             ),
+            "train_rows": int(globals().get("train_rows", 0)),
+            "test_rows": int(globals().get("test_rows", 0)),
+            "train_period": globals().get("train_period", ""),
+            "test_period": globals().get("test_period", ""),
             "models_used": [] if results_df is None else results_df["model"].tolist(),
+            "best_model": globals().get("best_model_name", ""),
+            "best_model_metrics": globals().get("best_model_metrics", {}),
+            "has_prediction_table": bool(globals().get("has_prediction_table", False)),
         },
         "dashboard": {
-            "has_extra_dashboard_plots": isinstance(results_df, pd.DataFrame),
+            "has_extra_dashboard_plots": isinstance(results_df, pd.DataFrame) and not results_df.empty,
             "dashboard_notes": (
-                "Added real-world energy image, KPI cards, actual-vs-predicted curve, "
-                "forecast error curve, model comparison chart, average daily demand pattern, "
-                "largest error table, and interpretation."
-                if isinstance(results_df, pd.DataFrame)
+                "Added real-world energy image, KPI cards, actual-vs-predicted demand curve, "
+                "forecast error curve, residual distribution, actual-vs-predicted scatter plot, "
+                "model comparison chart, average daily demand pattern, largest error table, and interpretation."
+                if isinstance(results_df, pd.DataFrame) and not results_df.empty
                 else ""
+            ),
+            "dashboard_elements": (
+                [
+                    "real-world energy image",
+                    "KPI cards",
+                    "actual vs predicted curve",
+                    "forecast error curve",
+                    "residual distribution",
+                    "actual vs predicted scatter plot",
+                    "model comparison bar chart",
+                    "average daily demand pattern",
+                    "largest forecast error table",
+                    "written interpretation",
+                ]
+                if isinstance(results_df, pd.DataFrame) and not results_df.empty
+                else []
             ),
         },
         "presentation": {
             "insights": insights_text,
+            "professional_summary": globals().get("professional_summary", ""),
         },
     }
     return evidence
@@ -406,6 +442,65 @@ st.info(
     "Students must add modeling, metrics, and extra visuals in the sections below."
 )
 
+# Automatic data-quality evidence for the exported submission.json.
+timestamp_diffs = ts_df[timestamp_col].diff().dropna()
+if len(timestamp_diffs) > 0:
+    inferred_step = timestamp_diffs.mode().iloc[0]
+    inferred_frequency_text = str(inferred_step)
+    expected_gap_threshold = inferred_step * 1.5
+    time_gap_count = int((timestamp_diffs > expected_gap_threshold).sum())
+else:
+    inferred_step = pd.NaT
+    inferred_frequency_text = "Not enough rows to infer"
+    time_gap_count = 0
+
+duplicate_timestamp_count = int(ts_df[timestamp_col].duplicated().sum())
+invalid_rows_removed = int(len(raw_df) - len(ts_df))
+target_missing_percent = float(pd.to_numeric(raw_df[target_col], errors="coerce").isna().mean() * 100)
+
+target_series = ts_df[target_col].dropna()
+if len(target_series) > 0:
+    q1 = float(target_series.quantile(0.25))
+    q3 = float(target_series.quantile(0.75))
+    iqr = q3 - q1
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    outlier_count = int(((target_series < lower_bound) | (target_series > upper_bound)).sum())
+    outlier_percent = float(outlier_count / len(target_series) * 100)
+    target_summary_text = (
+        f"Target summary: min={target_series.min():,.2f}, max={target_series.max():,.2f}, "
+        f"mean={target_series.mean():,.2f}, std={target_series.std():,.2f}."
+    )
+else:
+    lower_bound = np.nan
+    upper_bound = np.nan
+    outlier_count = 0
+    outlier_percent = 0.0
+    target_summary_text = "Target summary unavailable."
+
+data_quality_auto_summary = (
+    f"Automatic checks: {invalid_rows_removed:,} invalid rows removed after timestamp/target parsing; "
+    f"{duplicate_timestamp_count:,} duplicate timestamps found; inferred time step is {inferred_frequency_text}; "
+    f"{time_gap_count:,} larger-than-expected timestamp gaps detected; target missing rate before cleaning is "
+    f"{target_missing_percent:.2f}%."
+)
+
+outlier_auto_summary = (
+    f"Automatic IQR check for {target_col}: {outlier_count:,} potential outliers "
+    f"({outlier_percent:.2f}%) using bounds {lower_bound:,.2f} to {upper_bound:,.2f}. "
+    "These values were not removed automatically because extreme electricity demand can be operationally meaningful."
+)
+
+resampling_auto_summary = (
+    f"Selected option: {resampling_choice}. Prepared rows after optional resampling: {len(prepared_df):,}. "
+    f"The forecast horizon is {int(horizon)} row(s) after resampling, so the target y is shifted forward by that horizon."
+)
+
+st.subheader("Automatic data-quality evidence")
+st.write(data_quality_auto_summary)
+st.write(outlier_auto_summary)
+st.write(resampling_auto_summary)
+
 st.header("5. STUDENT ADDITIONS — MODELING")
 st.markdown("Add your model training, time-based split, predictions, and metrics table here.")
 st.code(
@@ -492,10 +587,20 @@ else:
     test_time = model_df[timestamp_col].iloc[split_index:].reset_index(drop=True)
     actual_values = y_test.reset_index(drop=True)
 
-    st.success(
-        f"Time-based split completed: {len(X_train):,} training rows "
-        f"and {len(X_test):,} testing rows."
+    train_rows = int(len(X_train))
+    test_rows = int(len(X_test))
+    train_period = f"{model_df[timestamp_col].iloc[0]} to {model_df[timestamp_col].iloc[split_index - 1]}"
+    test_period = f"{model_df[timestamp_col].iloc[split_index]} to {model_df[timestamp_col].iloc[-1]}"
+    time_split_evidence = (
+        f"Chronological 80/20 split used. Training period: {train_period}; "
+        f"testing period: {test_period}. No random shuffling was used."
     )
+
+    st.success(
+        f"Time-based split completed: {train_rows:,} training rows "
+        f"and {test_rows:,} testing rows."
+    )
+    st.caption(time_split_evidence)
 
     models = {
         "Linear Regression": LinearRegression(),
@@ -564,6 +669,18 @@ else:
     best_rmse = float(results_df.iloc[0]["RMSE"])
     best_mape = float(results_df.iloc[0]["MAPE"])
     best_r2 = float(results_df.iloc[0]["R2"])
+    best_model_metrics = {
+        "MAE": best_mae,
+        "RMSE": best_rmse,
+        "MAPE": best_mape,
+        "R2": best_r2,
+    }
+    has_prediction_table = True
+    professional_summary = (
+        f"Best model: {best_model_name}. Test performance: MAE={best_mae:,.2f}, "
+        f"RMSE={best_rmse:,.2f}, MAPE={best_mape:.2f}%, R2={best_r2:.3f}. "
+        "The model was evaluated using a future holdout period from the chronological time-based split."
+    )
 
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     kpi1.metric("Best model", best_model_name)
@@ -658,6 +775,27 @@ if results_df is not None and "best_predictions_df" in globals() and not best_pr
     ax2.legend()
     plt.xticks(rotation=30)
     st.pyplot(fig2)
+
+    st.markdown("### Residual distribution")
+    residuals = curve_df["actual"] - curve_df["prediction"]
+    fig_resid, ax_resid = plt.subplots(figsize=(9, 4))
+    ax_resid.hist(residuals, bins=30)
+    ax_resid.set_title("Residual Distribution")
+    ax_resid.set_xlabel("Actual - Predicted")
+    ax_resid.set_ylabel("Frequency")
+    st.pyplot(fig_resid)
+
+    st.markdown("### Actual vs predicted scatter")
+    fig_scatter, ax_scatter = plt.subplots(figsize=(6, 6))
+    ax_scatter.scatter(curve_df["actual"], curve_df["prediction"], alpha=0.7)
+    min_val = float(min(curve_df["actual"].min(), curve_df["prediction"].min()))
+    max_val = float(max(curve_df["actual"].max(), curve_df["prediction"].max()))
+    ax_scatter.plot([min_val, max_val], [min_val, max_val], linestyle="--", label="Perfect forecast line")
+    ax_scatter.set_title("Actual vs Predicted Scatter")
+    ax_scatter.set_xlabel("Actual demand")
+    ax_scatter.set_ylabel("Predicted demand")
+    ax_scatter.legend()
+    st.pyplot(fig_scatter)
 
     st.markdown("### Model comparison")
     metric_choice = st.selectbox(
